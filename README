@@ -1,0 +1,11 @@
+Command line interface to SVK mBank (https://sk.mbank.eu).
+Original script: http://code.google.com/p/mbank-cli/
+CZ version: http://wiki.airdump.cz/Skript_mbank-cli_%28CZ%29
+
+The Czech page version contains information on how to set up GPG
+encrypted configuration.
+
+Currently the tested commands are:
+- list
+- future
+- logout

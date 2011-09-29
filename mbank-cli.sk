@@ -1,0 +1,842 @@
+#!/usr/bin/perl
+
+# Copyright (c) 2006, 2007, 2008, 2009, 2010, 2011
+#   Piotr Lewandowski <piotr.lewandowski@gmail.com>,
+#   Jakub Wilk <jwilk@jwilk.net>.
+#   bX > airdump.cz for cz.mbank.eu use
+#   mehturt@gmail.com
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License, version 2, as published
+# by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, see <http://www.gnu.org/licenses>.
+#
+# Linking mbank-cli statically or dynamically with other modules is making a
+# combined work based on mbank-cli. Thus, the terms and conditions of the GNU
+# General Public License cover the whole combination.
+#
+# In addition, as a special exception, the copyright holders of mbank-cli give
+# you permission to combine mbank-cli with the OpenSSL library (or modified
+# versions of this library, with unchanged license). You may copy and
+# distribute such a system following the terms of the GNU GPL for mbank-cli
+# and the licenses of the OpenSSL library, provided that you include the
+# source code of that other code when and as the GNU GPL requires distribution
+# of source code.
+#
+# Note that people who make modified versions of mbank-cli are not obligated
+# to grant this special exception for their modified versions; it is their
+# choice whether to do so. The GNU General Public License gives permission to
+# release a modified version without this exception; this exception also makes
+# it possible to release a modified version which carries forward this
+# exception.
+
+use strict;
+use warnings;
+no encoding;
+
+use Apache::ConfigFile ();
+use Carp ();
+use Crypt::SSLeay ();
+use Digest ();
+use File::Basename qw(dirname);
+use Getopt::Long qw(:config gnu_compat permute no_getopt_compat no_ignore_case);
+use HTML::Form ();
+use HTTP::Cookies ();
+use HTTP::Request::Common qw(GET POST);
+use I18N::Langinfo qw(langinfo CODESET);
+use HTML::Entities ();
+use LWP::UserAgent ();
+use POSIX qw(mktime strftime);
+use Encode ();
+
+use constant
+{
+  EC_OK => 0,
+  EC_USER_ERROR => 1,
+  EC_HTTP_ERROR => 2,
+  EC_API_ERROR => 3,
+  WEB_CODESET => 'ISO-8859-2',
+  FAKE_DOMAIN => 'mbank-cli.invalid',
+  GPG => '/usr/bin/gpg'
+};
+
+chdir dirname($0) or die "Can't change working directory: $!";
+
+my $mbank_host = 'sk.mbank.eu';
+my $mbank = "https://$mbank_host";
+my $cookie_jar_file = './cookie-jar.txt';
+my $config_file = './mbank-cli.conf';
+
+$::locale_codeset = langinfo(CODESET);
+%::fallback_map = (
+  0x104 => 'A', 0x105 => 'a',
+  0x106 => 'C', 0x107 => 'c',
+  0x118 => 'E', 0x119 => 'e',
+  0x141 => 'L', 0x142 => 'l',
+  0x143 => 'N', 0x144 => 'n',
+  0x0d3 => 'O', 0x0f3 => 'o',
+  0x15a => 'S', 0x15B => 's',
+  0x179 => 'Z', 0x17A => 'z',
+  0x17B => 'Z', 0x17C => 'z',
+);
+
+sub encoding_fallback($)
+{
+  (local $_) = @_;
+  return $::fallback_map{$_} if exists $::fallback_map{$_};
+  return sprintf "<U+%04X>", $_;
+}
+
+sub widen_string($;$)
+{
+  (local $_, my $codeset) = @_;
+  $codeset //= $::locale_codeset;
+  return Encode::decode($codeset, $_);
+}
+
+sub localize_html_string($;$)
+{
+  (local $_, my $codeset) = @_;
+  $codeset //= WEB_CODESET;
+  $_ = widen_string $_, $codeset;
+  $_ = HTML::Entities::decode_entities $_;
+  return Encode::encode($::locale_codeset, $_, \&encoding_fallback);
+}
+
+sub lwp_init()
+{
+  my $ca_dir = $ENV{HTTPS_CA_DIR};
+  $ca_dir //= '/etc/ssl/certs/';
+  map { delete $ENV{$_}; } grep(/^HTTPS_/, keys %ENV);
+  $ENV{'HTTPS_VERSION'} = 3;
+  $ENV{'HTTPS_DEBUG'} = 0;
+  $ENV{'HTTPS_CA_DIR'} = $ca_dir;
+  my $ua = new LWP::UserAgent(
+    agent => 'Mozilla/5.0',
+    cookie_jar => HTTP::Cookies->new(file => $cookie_jar_file, autosave => 1, ignore_discard => 1),
+    requests_redirectable => ['GET', 'POST'],
+    protocols_allowed => ['https'],
+    timeout => 30
+  );
+  return $ua;
+}
+
+my $ua = lwp_init();
+
+my $verbose = 1;
+
+sub write_log($)
+{
+  local ($_) = @_;
+  open LOG, '>>', "debug/log" or return;
+  print LOG "$_\n";
+  close LOG;
+}
+
+sub debug($)
+{
+  local ($_) = @_;
+  write_log $_;
+  print STDERR "$_\n" if $verbose;
+}
+
+sub user_error($)
+{
+  local ($_) = @_;
+  write_log $_;
+  print STDERR "$_\n";
+  exit EC_USER_ERROR;
+}
+
+sub api_error($)
+{
+  local ($_) = @_;
+  $_ = sprintf 'Oops, API error! [%s]', $_;
+  write_log $_;
+  Carp::cluck $_;
+  exit EC_API_ERROR;
+}
+
+sub http_error($)
+{
+  my ($request) = @_;
+  $_ = sprintf 'HTTP error while processing request <%s %s>', $request->method, $request->uri;
+  write_log $_;
+  Carp::cluck $_;
+  exit EC_HTTP_ERROR;
+}
+
+sub shorten_uri($)
+{
+  local ($_) = @_;
+  s/&sMenu=.*?&/&/;
+  s/[?]sErrDescr=&sErrSource=&/?/;
+  return $_;
+}
+
+sub check_for_error($)
+{
+  local ($_) = @_;
+  return $1 if m{
+    <div[ ]id="errorView"[ ]class="[^"]+">
+    \s* <h3> \s* (.*?) \s* </h3> \s*
+  }x;
+  return '';
+}
+
+sub download($)
+{
+  my ($request) = @_;
+  my $subject_regex = $mbank_host;
+  # LWP does not check if hostname matches CN, we need to check that manually.
+  $subject_regex =~ s/[.]/[.]/g;
+  $subject_regex = "[/]CN=$subject_regex\$";
+  $request->header('If-SSL-Cert-Subject' => $subject_regex);
+  debug sprintf('Download <%s %s>', $request->method, $request->uri);
+  my $response = $ua->request($request);
+  http_error $request unless $response->is_success;
+  my $content = $response->content;
+  $content =~ s/\r//g;
+  my $error = check_for_error($content);
+  my $filename = $request->uri;
+  $filename =~ s{^\w+://.*?/}{};
+  $filename =~ s/[?].*//;
+  $filename =~ s/[^[:alnum:].]/_/g;
+  $filename =~ s/(?:[.]\w+)?$/.html/;
+  $filename = 'index.html' if $filename eq '.html';
+  if (open LOG, '>', "debug/$filename")
+  {
+    print LOG $content;
+    close LOG or die "Can't close log file: $!";
+  }
+  return { response => $response, content => $content, error => $error };
+}
+
+sub preread_config()
+{
+  BEGIN
+  {
+    our $digest_module;
+    eval { $digest_module = Digest->new('SHA-256'); };
+    eval { $digest_module = Digest->new('SHA-1'); } if $@;
+    $digest_module = Digest->new('MD5') if $@;
+  }
+  user_error "Can't open the config file: $!" unless open CONFIG, '<', $config_file;
+  my $prev_digest = '';
+  $main::digest_module->new();
+  my $header = '';
+  read CONFIG, $header, 28;
+  my $need_decrypt = $header eq "-----BEGIN PGP MESSAGE-----\n" || $header =~ /^\x85\x02/;
+  $main::digest_module->add($header);
+  $main::digest_module->addfile(*CONFIG);
+  close CONFIG or die "Can't close config file: $!";
+  my $digest = $main::digest_module->b64digest();
+  $ua->cookie_jar->scan(
+    sub
+    {
+      my ($version, $key, $val, $path, $domain) = @_;
+      $prev_digest = $val if $domain eq FAKE_DOMAIN and $path eq '/config/' and $key eq 'sha1';
+      # for compatibily reasons, key is named 'sha1' rather than 'digest'
+    }
+  );
+  if ($digest ne $prev_digest)
+  {
+    debug 'Your personality has just changed';
+    $ua->cookie_jar->clear();
+  }
+  $ua->cookie_jar->set_cookie(0, 'sha1', $digest, '/config/', FAKE_DOMAIN, undef, undef, undef, 1 << 25, undef);
+  return $need_decrypt;
+}
+
+sub read_config($)
+{
+  my ($need_decrypt) = @_;
+  user_error "Can't open the config file: $!" unless open STDIN, '<', $config_file;
+  my $fileno;
+  if ($need_decrypt)
+  {
+    open GPG, '-|', GPG, '--decrypt' or die "Can't invoke gpg: $!";
+    $fileno = fileno GPG;
+  }
+  else
+  {
+    $fileno = fileno STDIN;
+  }
+  my $ac = Apache::ConfigFile->read(
+    file => "&$fileno",
+    ignore_case  => 1,
+    fix_booleans => 1,
+    raise_error  => 1
+  );
+  close GPG or user_error q(Can't read the config file) if $need_decrypt;
+  close STDIN or die "Can't close pipe: $!";
+  my $login = $ac->cmd_config('Login');
+  user_error('No login name provided') unless defined $login;
+  user_error("Invalid login name '$login'") unless $login =~ /\d+/;
+  my $password = $ac->cmd_config('Password');
+  user_error('No password provided') unless defined $password;
+  user_error("Invalid password '$password'") unless length($password) > 0;
+  return ($login, $password)
+}
+
+sub do_logout()
+{
+  debug 'Logging out...';
+  $ua->protocols_allowed(['http', 'https']);
+  my $have_cookies = 0;
+  $ua->cookie_jar->scan(
+    sub
+    {
+      my ($version, $key, $val, $path, $domain) = @_;
+      $have_cookies = 1 unless $domain eq FAKE_DOMAIN;
+    }
+  );
+  user_error 'You are not logged in' unless $have_cookies;
+  my $web_logout = download GET("$mbank/logout.aspx");
+  $ua->cookie_jar->clear();
+  debug 'Cookies has been wiped out';
+  if (check_session_expiry($web_logout))
+  {
+    debug 'Probably you have been already logged out'
+  }
+  else
+  {
+    $web_logout->{content} =~ '<title>mBank - odhlásenie z Internet Banking</title>' or api_error('Logout1');
+  }
+}
+
+sub do_login($$)
+{
+  debug 'Loggin in...';
+  my ($web_in, $need_decrypt) = @_;
+  my @forms = HTML::Form->parse($web_in->{response});
+  $#forms == 0 or api_error('Login1');
+  my ($form) = @forms;
+  my $in_login = $form->find_input('customer', 'text');
+  my $in_passw = $form->find_input('password', 'password');
+  api_error('Login2L') unless defined $in_login;
+  api_error('Login2P') unless defined $in_passw;
+  api_error('Login2S') unless $web_in->{content} =~ m{<button id="confirm" onclick="([^"]+)" class="button">};
+  my $onclick = $1;
+  my ($login, $passw) = read_config($need_decrypt);
+  $in_login->value($login);
+  $in_passw->value($passw);
+  my $web_out = download onclick_to_req($form, $onclick);
+ print $web_out->{error};
+  user_error 'Login error: incorrect login/password' if $web_out->{error} eq "B\xb3\xb1d logowania";
+  api_error(sprintf 'LoginX [%s]', $web_out->{error}) if $web_out->{error} ne '';
+  return $web_out;
+}
+
+sub parse_amount($)
+{
+  local ($_) = @_;
+  s/(\s|\xa0)//g;
+  my $number_re = qr{(-?)(\d+),(\d{2})};
+  m{^$number_re$} or m{>$number_re<} or return undef;
+  my $amount = int($2) + int($3) / 100.0;
+  $amount = -$amount if $1;
+  return $amount;
+}
+
+sub onclick_to_req($$)
+{
+  my ($form, $onclick) = @_;
+  $onclick =~ m{^doSubmit[(]'(/?\w+[.]aspx)?','','(?:POST)?',(?:'([^']*?)'|null),.*?,(?:\w+|'(.*?)')[)];} or
+    $onclick =~ /^return OperationHistoryExport[(]export_oper_history_check, '\w+[.]aspx', '(\w+[.]aspx)'[)]/ or
+    api_error('OnClick');
+  $form->action("$mbank/$1") if defined $1;
+  $form->value('__PARAMETERS', $2) if defined $2;
+  my $js = $3;
+  if (defined $js and $js eq 'var dt\\; dt = new Date(\\)\\; document.MainForm.localDT.value = dt.toLocaleString(\\)\\;')
+  {
+    my $date = strftime('%a %b %d %H:%M:%S %Y', localtime());
+    $form->value('localDT', $date);
+  }
+  return $form->click();
+}
+
+sub do_operations($$)
+{
+  my ($web, $name) = @_;
+
+  return if $web->{content} =~ m{<p class="message">Brak operacji [^<]*</p>};
+  if ($web->{content} =~ m{<p class="message">Nieprawid\xB3owa data lub data poza dopuszczalnym zakresem</p>})
+  {
+    user_error "Invalid date range"
+  }
+
+  WEB_LOOP: while (1)
+  {
+    $web->{content} =~ m{
+      <div[ ]id="account_operations"[ ]class="grid">
+      (.*?)
+      </div>
+    }sx or api_error('History1');
+    my $content = $1;
+    while ($content =~ m{<li(?:[ ]class="alternate")?>(.*?)</li>}go)
+    {
+      my $line = $1;
+      $line =~ m{
+        <p[ ]class="Date">
+        <span[ ]id="\w+"> (\d{2})-(\d{2})-(\d{4}) </span>
+        <span[ ]id="\w+"> (\d{2})-(\d{2})-(\d{4}) </span>
+        </p>
+        <p[ ]class="CheckBox">
+        (?: <span[ ]class="checkBox"><input[ ]id="\w+" [^>]*></span> | &nbsp; )
+        </p>
+        <p[ ]class="OperationDescription">
+        <a[ ]id="account_operations_grid_ctl\d+_MLink_\d+_\d+"[ ]title="[^"]*"[ ][^>]*> ( (?:[^<]+|<wbr(?:[ ]/)?>)+ ) </a>
+        ( (?: <span> (?:[^<]+|<wbr(?:[ ]/)?>)+ </span> )* )
+        </p>
+        <p[ ]class="Amount"><span[ ]id="\w+"[^>]*> ( [0-9, -]+ ) ( [A-Z]+ ) </span></p>
+        <p[ ]class="Amount"><span[ ]id="\w+"[^>]*> ( [0-9, -]+ ) ( [A-Z]+ ) </span></p>
+      }x or api_error('History2');
+      my $date1 = "$3-$2-$1";
+      my $date2 = "$6-$5-$4";
+      my $amount = parse_amount($9);
+      defined $amount or api_error('History3');
+      my $amount_c = $10;
+      my $balance = parse_amount($11);
+      defined $balance or api_error('History4');
+      my $balance_c = $12;
+      my $details = "$7\t$8";
+      $details =~ s{</span><span>}{\t}g;
+      $details =~ s{<[^>]*>}{}g;
+      $details =~ s{&shy;}{}g;
+      $details = localize_html_string($details);
+      $details =~ s/ +/ /g;
+      $details =~ s/ +$/ /g;
+      print "$name\t" if defined $name;
+      printf "%s\t%s\t%8.2f %s\t%8.2f %s\t%s\n", $date1, $date2, $amount, $amount_c, $balance, $balance_c, $details;
+    }
+    if ($content =~ m{<button id="PrevPage" onclick="([^"]+)" class="button">Poprzednie&nbsp;operacje</button>})
+    {
+      my $onclick = $1;
+      my @forms = HTML::Form->parse($web->{response});
+      $#forms == 0 or api_error('HistoryPrevForm');
+      my ($form) = @forms;
+      foreach my $input ($form->inputs)
+      {
+        $input->disabled(1) if defined $input->name and $input->name =~ '^lastdays_\w+$';
+      }
+      my $prev_req = onclick_to_req($form, $onclick);
+      $web = download $prev_req;
+      next WEB_LOOP;
+    }
+    last WEB_LOOP;
+  }
+}
+
+sub correct_date($)
+{
+  local ($_) = @_;
+  return undef unless defined $_;
+  my $time;
+  return $_ if $_ eq 'now';
+  if (m/(\d{4})-(\d{2})-(\d{2})/)
+  {
+    $time = mktime 0, 0, 0, $3, $2-1, $1-1900;
+    @_ = localtime $time;
+    return $_ if
+      $3 == $_[3] and
+      $2 == $_[4] + 1 and
+      $1 == $_[5] + 1900 and
+      $1 >= 1900;
+  }
+  debug "Invalid date: $_";
+  return undef;
+}
+
+sub ground_date($$)
+{
+  my ($date, $now) = @_;
+  $date = $now if $date eq 'now';
+  $date =~ m/^(\d{4})-(\d\d)-(\d\d)$/ or die;
+  return ($1, $2, $3);
+}
+
+sub check_session_expiry($)
+{
+  my ($web) = @_;
+  return 1
+    if ($web->{error} eq "B\xb3\xb1d systemu" and
+    $web->{content} =~ m{
+      <p[ ]class="message">
+      Alarm[ ]bezpiecze\xf1stwa[.][ ]Nieprawid\xb3owy[ ]lub[ ]niewa\xbfny[ ]klucz[ ]sesji[.]
+      </p>
+    }x);
+}
+
+my ($opt_from, $opt_to);
+my $opt_range = undef;
+my $opt_multiple_accounts = 0;
+GetOptions(
+  'verbose' => \$verbose,
+  'config=s' => \$config_file,
+  'from=s' => sub
+    {
+      shift;
+      $opt_from = correct_date shift;
+      $opt_range = 0;
+    },
+  'to=s' => sub
+    {
+      shift;
+      $opt_to = correct_date shift;
+      $opt_range = 0;
+    },
+  'range=s{2}' => sub
+    {
+      shift;
+      if (($opt_range || 0) == 0)
+      {
+        $opt_from = correct_date shift;
+        $opt_to = undef;
+        $opt_range = 1;
+      }
+      else
+      {
+        $opt_to = correct_date shift;
+        $opt_range = 0;
+      }
+    },
+  'multiple-accounts' => sub
+    {
+      $opt_multiple_accounts = 1;
+    },
+  'all-accounts' => sub
+    {
+      $opt_multiple_accounts = 99;
+    },
+) or exit EC_USER_ERROR;
+
+my $need_decrypt_config = preread_config();
+
+my $action = shift @ARGV;
+$action //= 'list';
+my $selected_accounts;
+my $new_account_name;
+
+debug "Action: $action";
+
+exit EC_OK if $action eq 'void';
+
+if ($action eq 'logout')
+{
+  do_logout();
+  exit EC_OK;
+}
+elsif ($action =~ '^history|future|withholdings|notices$')
+{
+  $opt_multiple_accounts++ if $opt_multiple_accounts == 0 and $#ARGV > 0;
+  if ($opt_multiple_accounts > 1)
+  {
+    $selected_accounts = qr(^);
+  }
+  else
+  {
+    user_error 'No account selected' if $#ARGV < 0;
+    @_ = map { widen_string $_ } @ARGV;
+    @_ = map quotemeta, @_;
+    $_ = join '|', @_;
+    s/\\\*/.*/g;
+    $selected_accounts = qr/^($_)$/;
+  }
+  if ($action eq 'history')
+  {
+    if (defined $opt_range)
+    {
+      $opt_to = correct_date 'now' if defined $opt_from and not defined $opt_to;
+      user_error 'No or invalid time range selected' unless defined $opt_from and defined $opt_to and ($opt_to ge $opt_from);
+      debug "Using time range $opt_from ... $opt_to";
+    }
+    else
+    {
+      debug 'Using default time range';
+    }
+  }
+}
+elsif ($action eq 'rename')
+{
+  user_error 'No account selected' if $#ARGV < 0;
+  user_error 'No new account name provided' if $#ARGV < 1;
+  $_ = widen_string shift;
+  $_ = quotemeta $_;
+  s/\\\*/.*/g;
+  $selected_accounts = qr/^$_$/;
+  $_ = widen_string shift;
+  user_error 'Invalid new account name' if not defined $_;
+  $new_account_name = $_;
+}
+elsif ($action eq 'list' or $action eq 'funds')
+{ }
+else
+{
+  user_error 'Invalid action';
+}
+
+my $need_login = 1;
+my $web_accounts_list;
+
+$ua->cookie_jar->scan(
+  sub
+  {
+    my ($version, $key, $val, $path, $domain) = @_;
+    $need_login = 0 if $domain eq FAKE_DOMAIN and $path eq '/login-options/';
+  }
+);
+if (!$need_login)
+{
+  debug 'Trying to reuse previous session';
+  $web_accounts_list = download GET("$mbank/accounts_list.aspx");
+  if (check_session_expiry($web_accounts_list))
+  {
+    debug 'Invalid or expired session key';
+    $need_login = 1;
+  }
+  elsif ($web_accounts_list->{error} ne '')
+  {
+    api_error('PreLogin: ' . $web_accounts_list->{error});
+  }
+}
+
+if ($need_login)
+{
+  debug 'A new session will be created';
+  $need_login = 1;
+  my $web_login = download GET("$mbank/");
+  my $web_frames = do_login($web_login, $need_decrypt_config);
+  $ua->cookie_jar->set_cookie(0, 'dummy', '', '/login-options/', FAKE_DOMAIN, undef, undef, undef, 604800, undef);
+  $web_accounts_list = download GET("$mbank/accounts_list.aspx");
+}
+
+my $accounts_re = qr{.*<div id="AccountsGrid" class="grid">(.*?)</div>.*}s;
+$web_accounts_list->{content} =~ s/$accounts_re/$1/ or api_error('AccountsList0');
+
+$accounts_re = qr{
+<p[ ]class="Account">
+<a[ ]id="\w+"[ ]title="Vybrat[ ]tento[ ][^"]*et"[ ]onclick="([^"]*)" [^>]*?>
+(?:
+  (.+?) [ ] (\d\d[ ]\d\d\d\d[ ]\d\d\d\d[ ]\d\d\d\d[ ]\d\d\d\d[ ]\d\d\d\d[ ]\d\d\d\d) |
+  Konto [ ] MOBILE
+)
+</a>
+</p>
+<p[ ]class="Amount">
+(?:
+  <a[ ]id="\w+"[ ]title="Zobrazit[^"]*operace[^"]*" [^>]*? onclick="([^"]*)" [^>]*?>
+  (-?[0-9 ,]+) [ ] ([A-Z]+)
+  </a>
+|
+  <span> [0-9]+ [ ] MIN </span>
+)
+</p>
+<p[ ]class="Amount">
+(?:
+  <span[ ]id="\w+">
+  (-?[0-9 ,]+) [ ] ([A-Z]+)
+  </span>
+)?
+</p>
+}x;
+$accounts_re = qr{
+<p[ ]class="Account">
+<a[ ]id="AccountsGrid_grid_ctl0\d_MLink_\d_0"[ ]title="[^"]*"[ ]onclick="([^"]*)" [^>]*?>
+(?:
+  (.+?) [ ] (\d+-\d+/\d+) |
+  Konto [ ] MOBILE
+)
+</a>
+</p>
+<p[ ]class="Amount">
+(?:
+  <a[ ]id="AccountsGrid_grid_ctl0\d_MLink_\d_1"[ ]title="[^"]*" [^>]*? onclick="([^"]*)" [^>]*?>
+  (-?[0-9 ,]+) [ ] ([A-Z]+)
+  </a>
+|
+  <span> [0-9]+ [ ] CZK </span>
+)
+</p>
+<p[ ]class="Amount">
+(?:
+  <span[ ]id="\w+">
+  (-?[0-9 ,]+) [ ] ([A-Z]+)
+  </span>
+)?
+</p>
+}x;
+$web_accounts_list->{content} =~ m{$accounts_re} or api_error('AccountsList0');
+
+my @accounts_list_forms = HTML::Form->parse($web_accounts_list->{response});
+$#accounts_list_forms == 0 or api_error('AccountListForm');
+my ($accounts_list_form) = @accounts_list_forms;
+
+if ($action eq 'funds')
+{
+  $web_accounts_list->{content} =~ m{Brak rachunk\xf3w inwestycyjnych - </span><a onclick="doSubmit[(]'if_fund_list[.]aspx'} and exit;
+  $web_accounts_list->{content} =~ m{<a[ ]id="\w+"[ ]title="[^"]+?"[ ]onclick="([^"]*)" [^>]+?>Fundusze inwestycyjne} or api_error('Funds1');
+  my $web_funds_list = download onclick_to_req($accounts_list_form, $1);
+  my $fund_re = qr{<a.*?onclick="doSubmit\('if_fund_details.aspx',[^>]+?>([^<]+?)<.*?</span>.*?>([0-9 ,]+) ([A-Z]+)</span>};
+  while ($web_funds_list->{content} =~ m{$fund_re}go)
+  {
+    my $name = localize_html_string $1;
+    my $amount = parse_amount $2;
+    defined $amount or api_error('Funds2');
+    my $currency = $3;
+    printf "%s\t%8.2f %s\n", $name, $amount, $currency;
+  }
+  exit;
+}
+
+while ($web_accounts_list->{content} =~ m{<li(?:[ ]class="alternate")?>(.*?)</li>}go)
+{
+  my $line = $1;
+  $line =~ m{$accounts_re}go or api_error('AccountsList1');
+  next unless defined $3;
+  # FIXME: will the above fail if a balance / resources is negative?
+  my $account_details_req = onclick_to_req($accounts_list_form, $1);
+  my $name = localize_html_string $2;
+  my $no = $3;
+  my $operations_req = onclick_to_req($accounts_list_form, $4);
+  my $balance = parse_amount $5;
+  defined $balance or api_error('AccountsList2');
+  my $balance_c = $6;
+  my $resources = parse_amount $7;
+  defined $resources or api_error('AccountsList3');
+  my $resources_c = $8;
+  next if defined $selected_accounts and widen_string($name) !~ m/$selected_accounts/;
+  if ($action eq 'list')
+  {
+    printf "%s\t%32s\t%8.2f %s\t%8.2f %s\n", $name, $no, $balance, $balance_c, $resources, $resources_c;
+  }
+  elsif ($action eq 'history')
+  {
+    my $web_operations = download $operations_req;
+    my @forms = HTML::Form->parse($web_operations->{response});
+    $#forms == 0 or api_error('PreHistory1');
+    my ($form) = @forms;
+    if (defined $opt_range)
+    {
+      api_error('PreHistory3') unless $web_operations->{content} =~ m{DateValidator[(]theform[.]daterange_from_day, '19010101', '(\d{4})(\d\d)(\d\d)', '', ''[)]};
+      my $now = "$1-$2-$3";
+      my ($y, $m, $d) = ground_date($opt_from, $now);
+      $form->value('daterange_from_day', $d);
+      $form->value('daterange_from_month', $m);
+      $form->value('daterange_from_year', $y);
+      ($y, $m, $d) = ground_date($opt_to, $now);
+      $form->value('daterange_to_day', $d);
+      $form->value('daterange_to_month', $m);
+      $form->value('daterange_to_year', $y);
+      $form->value('rangepanel_group', 'daterange_radio');
+    }
+    foreach my $input ($form->inputs)
+    {
+      $input->disabled(1) if defined $input->name and $input->name =~ '^lastdays_(days|period)|ctl[0-9]+$';
+    }
+    api_error('PreHistory2') unless $web_operations->{content} =~ m{<button id="Submit" onclick="([^"]+)" class="button">};
+    my $onclick = $1;
+    $web_operations = download onclick_to_req($form, $onclick);
+    do_operations($web_operations, $opt_multiple_accounts ? $name : undef);
+  }
+  elsif ($action eq 'future')
+  {
+    my $web_operations = download $operations_req;
+    my $web_future_operations = download POST("$mbank/future_operation_list.aspx");
+    my $content = $web_future_operations->{content};
+    next if $content =~ m{<p class="message">Nem.te .iadne pl.novan. platby</p>};
+    $content =~ m{<div id="future_operation_list" class="grid">(.*)</div>}s or api_error('Future1');
+    $content = $1;
+    while ($content =~ m{<li(?:[ ]class="alternate")?>(.*?)</li>}go)
+    {
+      my $line = $1;
+      $line =~ m{
+        <p[ ]class="Date">
+        <span[ ]id="\w+"> (\d{4}-\d\d-\d\d) </span>
+        </p>
+        <p[ ]class="Customer">
+        <a[ ]id="\w+"[ ]title="[^"]+?"[ ]onclick="[^"]+?" [^>]+?> ([^>]+?) </a>
+        </p>
+        <p[ ]class="OperationDescription">
+        <span[ ]id="\w+"> ([^>]+?) </span>
+        </p>
+        <p[ ]class="Amount">
+        <span[ ]id="\w+"> ([0-9, ]+) [ ] ([A-Z]+) </span>
+        </p>
+        <p[ ]class="OperationStatus">
+        <span[ ]id="\w+"> ([^>]+?) </span>
+        </p>
+      }x or api_error('Future2');
+      my $date = $1;
+      my $receiver = localize_html_string $2;
+      my $title = localize_html_string $3;
+      $title =~ y/\xa0/ /;
+      my $amount = parse_amount $4;
+      my $currency = $5;
+      my $status = localize_html_string $6;
+      printf "$name\t", $name if $opt_multiple_accounts;
+      printf "%s\t%s\t%s\t%8.2f %s\t%s\n", $date, $receiver, $title, $amount, $currency, $status;
+    }
+  }
+  elsif ($action eq 'withholdings')
+  {
+    my $web_operations = download $operations_req;
+    my $web_withholdings = download POST("$mbank/witholdings_list.aspx");
+    my $withholding_re = qr{
+      <span[ ]id="\w+"> (\d\d)-(\d\d)-(\d{4}) </span>   .*?
+      <span[ ]id="\w+"> (\d\d)-(\d\d)-(\d{4}) </span>   .*?
+      <span[ ]id="\w+"> ([0-9, ]+) \s+ ([A-Z]+) </span>   .*?
+      <span[ ]id="\w+"> ([^>]+?) </span>
+    }x;
+    while ($web_withholdings->{content} =~ m{$withholding_re}go)
+    {
+      my $reg_date = "$3-$2-$1";
+      my $fin_date = "$6-$5-$4";
+      my $amount = parse_amount $7;
+      my $currency = $8;
+      my $title = localize_html_string $9;
+      printf "$name\t", $name if $opt_multiple_accounts;
+      printf "%s\t%s\t%8.2f %s\t%s\n", $reg_date, $fin_date, $amount, $currency, $title;
+    }
+  }
+  elsif ($action eq 'notices')
+  {
+    api_error('Notices');
+    # TODO
+  }
+  elsif ($action eq 'rename')
+  {
+    my $web_contract = download $account_details_req;
+    my @forms = HTML::Form->parse($web_contract->{response}, charset => WEB_CODESET);
+    $#forms == 0 or api_error('RenameForm1.0');
+    my ($form) = @forms;
+    $web_contract->{content} =~ m{
+      <button[ ]onclick="([^"]*)"[ ]class="button">
+      Zmiana&nbsp;nazwy&nbsp;rachunku
+      </button>
+    }x or api_error 'RenameForm1.1';
+    my $web_rename = download onclick_to_req($form, $1);
+    @forms = HTML::Form->parse($web_rename->{response});
+    $#forms == 0 or api_error('RenameForm2.0');
+    ($form) = @forms;
+    $form->value('tbVarPartAccName', $new_account_name);
+    $web_rename->{content} =~ m{
+      <button[ ]id="(Confirm)"[ ]onclick="([^"]*)"[ ]class="button">
+      Zatwierd\xbc
+      </button>
+    }x or api_error 'RenameForm2.1';
+    my ($submit, $onclick) = ($1, $2);
+    $form->value($submit, undef);
+    $web_rename = download onclick_to_req($form, $onclick);
+    $web_rename->{content} =~ m{<p class="message">Operacja wykonana poprawnie</p>} or api_error 'RenameAfter';
+  }
+}
+
+# vim:ts=2 sw=2 et fenc=utf-8

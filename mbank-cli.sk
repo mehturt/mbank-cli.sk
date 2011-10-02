@@ -394,7 +394,8 @@ sub do_operations($$)
         </p>
         <p[ ]class="OperationDescription">
         <a[ ]id="account_operations_grid_ctl\d+_MLink_\d+_\d+"[ ]title="[^"]*"[ ][^>]*> ( (?:[^<]+|<wbr(?:[ ]/)?>)+ ) </a>
-        ( (?: <span> (?:[^<]+|<wbr(?:[ ]/)?>)+ </span> )* )
+        ( (?: <span[> ] (?:[^<]+|<wbr(?:[ ]/)?>)+ </span> )* )
+	<span[ ]class="FilterType">\w+</span>
         </p>
         <p[ ]class="Amount"><span[ ]id="\w+"[^>]*> ( [0-9, -]+ ) ( [A-Z]+ ) </span></p>
         <p[ ]class="Amount"><span[ ]id="\w+"[^>]*> ( [0-9, -]+ ) ( [A-Z]+ ) </span></p>

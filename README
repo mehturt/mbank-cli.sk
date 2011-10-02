@@ -7,5 +7,6 @@ encrypted configuration.
 
 Currently the tested commands are:
 - list
+- history
 - future
 - logout

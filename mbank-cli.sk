@@ -619,7 +619,7 @@ if ($need_login)
   $web_accounts_list = download GET("$mbank/accounts_list.aspx");
 }
 
-my $accounts_re = qr{.*<div id="AccountsGrid" class="grid">(.*?)</div>.*}s;
+my $accounts_re = qr{.*<div id="AccountsGrid_.*" class="grid">(.*?)</div>.*}s;
 $web_accounts_list->{content} =~ s/$accounts_re/$1/ or api_error('AccountsList0');
 
 $accounts_re = qr{

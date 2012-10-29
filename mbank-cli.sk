@@ -41,7 +41,10 @@ use strict;
 use warnings;
 no encoding;
 
-use Apache::ConfigFile ();
+BEGIN {
+  $ENV{PERL_NET_HTTPS_SSL_SOCKET_CLASS} = 'Net::SSL'; # prefer Crypt-SSLeay
+}
+
 use Carp ();
 use Crypt::SSLeay ();
 use Digest ();
@@ -55,6 +58,7 @@ use HTML::Entities ();
 use LWP::UserAgent ();
 use POSIX qw(mktime strftime);
 use Encode ();
+use Text::ParseWords ();
 
 use constant
 {
@@ -64,7 +68,7 @@ use constant
   EC_API_ERROR => 3,
   WEB_CODESET => 'ISO-8859-2',
   FAKE_DOMAIN => 'mbank-cli.invalid',
-  GPG => '/usr/bin/gpg'
+  GPG_EXECUTABLE => '/usr/bin/gpg'
 };
 
 chdir dirname($0) or die "Can't change working directory: $!";
@@ -194,10 +198,8 @@ sub check_for_error($)
 sub download($)
 {
   my ($request) = @_;
-  my $subject_regex = $mbank_host;
   # LWP does not check if hostname matches CN, we need to check that manually.
-  $subject_regex =~ s/[.]/[.]/g;
-  $subject_regex = "[/]CN=$subject_regex\$";
+  my $subject_regex = qr(/CN=\Q$mbank_host\E$);
   $request->header('If-SSL-Cert-Subject' => $subject_regex);
   debug sprintf('Download <%s %s>', $request->method, $request->uri);
   my $response = $ua->request($request);
@@ -255,32 +257,54 @@ sub preread_config()
   return $need_decrypt;
 }
 
+sub read_config_file($)
+{
+  my ($fp) = @_;
+  my %result = ();
+  my $error;
+  local $_;
+  while (<$fp>)
+  {
+    next if /^(?:#|\s*)$/;
+    if (/^\s*([\w-]+)\s+(.*\S)\s*$/)
+    {
+      my $key = lc $1;
+      my ($value) = Text::ParseWords::parse_line('^$', 0, $2);
+      $result{$key} = $value;
+    }
+    elsif (not defined $error)
+    {
+      $error = $.;
+    }
+  }
+  if (defined $error)
+  {
+    user_error("Can't parse the config file (line $.)");
+  }
+  return %result;
+}
+
 sub read_config($)
 {
   my ($need_decrypt) = @_;
   user_error "Can't open the config file: $!" unless open STDIN, '<', $config_file;
-  my $fileno;
+  my $fp, my $gpg;
   if ($need_decrypt)
   {
-    open GPG, '-|', GPG, '--decrypt' or die "Can't invoke gpg: $!";
-    $fileno = fileno GPG;
+    open $gpg, '-|', GPG_EXECUTABLE, '--decrypt' or die "Can't invoke gpg: $!";
+    $fp = $gpg;
   }
   else
   {
-    $fileno = fileno STDIN;
+    $fp = \*STDIN;
   }
-  my $ac = Apache::ConfigFile->read(
-    file => "&$fileno",
-    ignore_case  => 1,
-    fix_booleans => 1,
-    raise_error  => 1
-  );
-  close GPG or user_error q(Can't read the config file) if $need_decrypt;
+  my %config = read_config_file($fp);
+  close $gpg or user_error q(Can't read the config file) if $need_decrypt;
   close STDIN or die "Can't close pipe: $!";
-  my $login = $ac->cmd_config('Login');
+  my $login = $config{'login'};
   user_error('No login name provided') unless defined $login;
-  user_error("Invalid login name '$login'") unless $login =~ /\d+/;
-  my $password = $ac->cmd_config('Password');
+  user_error("Invalid login name '$login'") unless $login =~ /^\d+$/;
+  my $password = $config{'password'};
   user_error('No password provided') unless defined $password;
   user_error("Invalid password '$password'") unless length($password) > 0;
   return ($login, $password)
@@ -301,7 +325,7 @@ sub do_logout()
   user_error 'You are not logged in' unless $have_cookies;
   my $web_logout = download GET("$mbank/logout.aspx");
   $ua->cookie_jar->clear();
-  debug 'Cookies has been wiped out';
+  debug 'Cookies have been wiped out';
   if (check_session_expiry($web_logout))
   {
     debug 'Probably you have been already logged out'
